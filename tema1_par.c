@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <time.h>
+#include <pthread.h>
 
 #define CONTOUR_CONFIG_COUNT    16
 #define FILENAME_MAX_SIZE       50
@@ -14,6 +16,35 @@
 #define RESCALE_Y               2048
 
 #define CLAMP(v, min, max) if(v < min) { v = min; } else if(v > max) { v = max; }
+
+#define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
+
+typedef struct {
+    int id;
+    int num_threads;
+    pthread_barrier_t *barrier;
+    ppm_image **rescaled_image;
+    ppm_image *main_image;
+} thread_args_t;
+
+
+void *thread_func(thread_args_t *args) {
+    pthread_barrier_wait(args->barrier);
+
+    if (args->rescaled_image != NULL) {
+        ppm_image *new_image = *(args->rescaled_image);
+        int start = args->id * (double)new_image->x / args->num_threads;
+        int end = MIN((args->id + 1) * (double)new_image->x / args->num_threads, new_image->x);
+
+        bicubic_interp(start, end, new_image, args->main_image);
+
+        args->main_image = new_image;
+    }
+
+    pthread_barrier_wait(args->barrier);
+
+    return NULL;
+}
 
 // Creates a map between the binary configuration (e.g. 0110_2) and the corresponding pixels
 // that need to be set on the output image. An array is used for this map since the keys are
@@ -57,7 +88,7 @@ unsigned char **sample_grid(ppm_image *image, int step_x, int step_y, unsigned c
     int p = image->x / step_x;
     int q = image->y / step_y;
 
-    unsigned char **grid = (unsigned char **)malloc((p + 1) * sizeof(unsigned char*));
+    unsigned char **grid = (unsigned char **)malloc((p + 1) * sizeof(unsigned char *));
     if (!grid) {
         fprintf(stderr, "Unable to allocate memory\n");
         exit(1);
@@ -146,9 +177,25 @@ void free_resources(ppm_image *image, ppm_image **contour_map, unsigned char **g
     free(image);
 }
 
-ppm_image *rescale_image(ppm_image *image) {
+void bicubic_interp(int start, int end, ppm_image *new_image, ppm_image *image) {
     uint8_t sample[3];
 
+    // use bicubic interpolation for scaling
+    for (int i = start; i < end; i++) {
+        for (int j = 0; j < new_image->y; j++) {
+            float u = (float)i / (float)(new_image->x - 1);
+            float v = (float)j / (float)(new_image->y - 1);
+            sample_bicubic(image, u, v, sample);
+
+            new_image->data[i * new_image->y + j].red = sample[0];
+            new_image->data[i * new_image->y + j].green = sample[1];
+            new_image->data[i * new_image->y + j].blue = sample[2];
+        }
+    }
+}
+
+ppm_image *rescale_image(ppm_image *image, ppm_image **rescaled_img,
+    pthread_barrier_t *barrier) {
     // we only rescale downwards
     if (image->x <= RESCALE_X && image->y <= RESCALE_Y) {
         return image;
@@ -163,24 +210,16 @@ ppm_image *rescale_image(ppm_image *image) {
     new_image->x = RESCALE_X;
     new_image->y = RESCALE_Y;
 
-    new_image->data = (ppm_pixel*)malloc(new_image->x * new_image->y * sizeof(ppm_pixel));
+    new_image->data = (ppm_pixel *)malloc(new_image->x * new_image->y * sizeof(ppm_pixel));
     if (!new_image) {
         fprintf(stderr, "Unable to allocate memory\n");
         exit(1);
     }
 
-    // use bicubic interpolation for scaling
-    for (int i = 0; i < new_image->x; i++) {
-        for (int j = 0; j < new_image->y; j++) {
-            float u = (float)i / (float)(new_image->x - 1);
-            float v = (float)j / (float)(new_image->y - 1);
-            sample_bicubic(image, u, v, sample);
+    *rescaled_img = new_image;
 
-            new_image->data[i * new_image->y + j].red = sample[0];
-            new_image->data[i * new_image->y + j].green = sample[1];
-            new_image->data[i * new_image->y + j].blue = sample[2];
-        }
-    }
+    pthread_barrier_wait(barrier);
+    pthread_barrier_wait(barrier);
 
     free(image->data);
     free(image);
@@ -198,20 +237,108 @@ int main(int argc, char *argv[]) {
     int step_x = STEP;
     int step_y = STEP;
 
+    int num_threads = argv[3];
+
+    pthread_barrier_t barrier;
+    pthread_barrier_init(&barrier, NULL, num_threads + 1);
+
+    pthread_t threads[num_threads];
+    thread_args_t *args[num_threads];
+    ppm_image *rescaled_img = NULL;
+
+    int r;
+
+    for (long id = 0; id < num_threads; id++) {
+        args[id] = malloc(sizeof(thread_args_t));
+
+        args[id]->num_threads;
+        args[id]->id = id;
+        args[id]->barrier = &barrier;
+        args[id]->rescaled_image = &rescaled_img;
+        args[id]->main_image = image;
+
+        r = pthread_create(&threads[id], NULL, thread_func, args[id]);
+
+        if (r) {
+            printf("Eroare la crearea thread-ului %ld\n", id);
+            exit(-1);
+        }
+    }
+
+#ifdef TIMER
+    struct timespec start, finish;
+    double elapsed;
+#endif
+
+#ifdef TIMER
+    clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
+
     // 0. Initialize contour map
     ppm_image **contour_map = init_contour_map();
 
+#ifdef TIMER
+    clock_gettime(CLOCK_MONOTONIC, &finish);
+    elapsed = (finish.tv_sec - start.tv_sec);
+    elapsed += (finish.tv_nsec - start.tv_nsec) / 1000000000.0;
+    printf("Initialize contour map time: %lf\n", elapsed);
+#endif
+
+#ifdef TIMER
+    clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
+
     // 1. Rescale the image
-    ppm_image *scaled_image = rescale_image(image);
+    ppm_image *scaled_image = rescale_image(image, &rescaled_img, &barrier);
+
+#ifdef TIMER
+    clock_gettime(CLOCK_MONOTONIC, &finish);
+    elapsed = (finish.tv_sec - start.tv_sec);
+    elapsed += (finish.tv_nsec - start.tv_nsec) / 1000000000.0;
+    printf("Rescale the image time: %lf\n", elapsed);
+#endif
+
+#ifdef TIMER
+    clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
 
     // 2. Sample the grid
     unsigned char **grid = sample_grid(scaled_image, step_x, step_y, SIGMA);
 
+#ifdef TIMER
+    clock_gettime(CLOCK_MONOTONIC, &finish);
+    elapsed = (finish.tv_sec - start.tv_sec);
+    elapsed += (finish.tv_nsec - start.tv_nsec) / 1000000000.0;
+    printf("Sample the grid time: %lf\n", elapsed);
+#endif
+
+#ifdef TIMER
+    clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
+
     // 3. March the squares
     march(scaled_image, grid, contour_map, step_x, step_y);
 
+#ifdef TIMER
+    clock_gettime(CLOCK_MONOTONIC, &finish);
+    elapsed = (finish.tv_sec - start.tv_sec);
+    elapsed += (finish.tv_nsec - start.tv_nsec) / 1000000000.0;
+    printf("March the squares time: %lf\n", elapsed);
+#endif
+
+#ifdef TIMER
+    clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
+
     // 4. Write output
     write_ppm(scaled_image, argv[2]);
+
+#ifdef TIMER
+    clock_gettime(CLOCK_MONOTONIC, &finish);
+    elapsed = (finish.tv_sec - start.tv_sec);
+    elapsed += (finish.tv_nsec - start.tv_nsec) / 1000000000.0;
+    printf("Write output time: %lf\n", elapsed);
+#endif
 
     free_resources(scaled_image, contour_map, grid, step_x);
 
