@@ -15,6 +15,8 @@
 #define RESCALE_X               2048
 #define RESCALE_Y               2048
 
+#define TIMER
+
 #define CLAMP(v, min, max) if(v < min) { v = min; } else if(v > max) { v = max; }
 
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
@@ -31,11 +33,12 @@ typedef struct {
         int step_x;
         int step_y;
     } sample_grid;
+    ppm_image ***contour_map_p;
 } thread_args_t;
 
 thread_args_t *init_thread_args(int num_threads, int id, pthread_barrier_t *barrier,
     ppm_image **rescaled_image_p, ppm_image *image,
-    unsigned char ***grid_p, int step_x, int step_y, int sigma) {
+    unsigned char ***grid_p, int step_x, int step_y, int sigma, ppm_image ***contour_map_p) {
 
     thread_args_t *args = malloc(sizeof(thread_args_t));
 
@@ -48,6 +51,7 @@ thread_args_t *init_thread_args(int num_threads, int id, pthread_barrier_t *barr
     args->sample_grid.step_x = step_x;
     args->sample_grid.step_y = step_y;
     args->sample_grid.sigma = sigma;
+    args->contour_map_p = contour_map_p;
 
     return args;
 }
@@ -120,12 +124,48 @@ void sample_grid_work(ppm_image *image, unsigned char **grid, int sigma,
     }
 }
 
+// Updates a particular section of an image with the corresponding contour pixels.
+// Used to create the complete contour image.
+void update_image(ppm_image *image, ppm_image *contour, int x, int y) {
+    for (int i = 0; i < contour->x; i++) {
+        for (int j = 0; j < contour->y; j++) {
+            int contour_pixel_index = contour->x * i + j;
+            int image_pixel_index = (x + i) * image->y + y + j;
+
+            image->data[image_pixel_index].red = contour->data[contour_pixel_index].red;
+            image->data[image_pixel_index].green = contour->data[contour_pixel_index].green;
+            image->data[image_pixel_index].blue = contour->data[contour_pixel_index].blue;
+        }
+    }
+}
+
+// Corresponds to step 2 of the marching squares algorithm, which focuses on identifying the
+// type of contour which corresponds to each subgrid. It determines the binary value of each
+// sample fragment of the original image and replaces the pixels in the original image with
+// the pixels of the corresponding contour image accordingly.
+void march(ppm_image *image, unsigned char **grid, ppm_image **contour_map, int step_x, int step_y,
+    int id, int num_threads) {
+    int p = image->x / step_x;
+    int q = image->y / step_y;
+
+    int start = id * (double)p / num_threads;
+    int end = MIN((id + 1) * (double)p / num_threads, p);
+
+    for (int i = start; i < end; i++) {
+        for (int j = 0; j < q; j++) {
+            unsigned char k = 8 * grid[i][j] + 4 * grid[i][j + 1] + 2 * grid[i + 1][j + 1] + 1 * grid[i + 1][j];
+            update_image(image, contour_map[k], i * step_x, j * step_y);
+        }
+    }
+}
+
 void *thread_func(void *void_args) {
     thread_args_t *args = (thread_args_t *)void_args;
 
     // Wait for all threads to be ready to start rescaling
     pthread_barrier_wait(args->barrier);
 
+    // Check if rescaling is needed
     if (*(args->rescaled_image_p) != NULL) {
         ppm_image *new_image = *(args->rescaled_image_p);
         int start = args->id * (double)new_image->x / args->num_threads;
@@ -148,6 +188,12 @@ void *thread_func(void *void_args) {
     // Wait for all threads to finish grid sampling
     pthread_barrier_wait(args->barrier);
 
+    march(args->main_image, *(args->sample_grid.grid_p), *(args->contour_map_p),
+        args->sample_grid.step_x, args->sample_grid.step_y, args->id, args->num_threads);
+
+    // Wait for all threads to finish march
+    pthread_barrier_wait(args->barrier);
+
     return NULL;
 }
 
@@ -168,21 +214,6 @@ ppm_image **init_contour_map() {
     }
 
     return map;
-}
-
-// Updates a particular section of an image with the corresponding contour pixels.
-// Used to create the complete contour image.
-void update_image(ppm_image *image, ppm_image *contour, int x, int y) {
-    for (int i = 0; i < contour->x; i++) {
-        for (int j = 0; j < contour->y; j++) {
-            int contour_pixel_index = contour->x * i + j;
-            int image_pixel_index = (x + i) * image->y + y + j;
-
-            image->data[image_pixel_index].red = contour->data[contour_pixel_index].red;
-            image->data[image_pixel_index].green = contour->data[contour_pixel_index].green;
-            image->data[image_pixel_index].blue = contour->data[contour_pixel_index].blue;
-        }
-    }
 }
 
 // Corresponds to step 1 of the marching squares algorithm, which focuses on sampling the image.
@@ -216,22 +247,6 @@ unsigned char **sample_grid(ppm_image *image, int step_x, int step_y, unsigned c
     pthread_barrier_wait(barrier);
 
     return grid;
-}
-
-// Corresponds to step 2 of the marching squares algorithm, which focuses on identifying the
-// type of contour which corresponds to each subgrid. It determines the binary value of each
-// sample fragment of the original image and replaces the pixels in the original image with
-// the pixels of the corresponding contour image accordingly.
-void march(ppm_image *image, unsigned char **grid, ppm_image **contour_map, int step_x, int step_y) {
-    int p = image->x / step_x;
-    int q = image->y / step_y;
-
-    for (int i = 0; i < p; i++) {
-        for (int j = 0; j < q; j++) {
-            unsigned char k = 8 * grid[i][j] + 4 * grid[i][j + 1] + 2 * grid[i + 1][j + 1] + 1 * grid[i + 1][j];
-            update_image(image, contour_map[k], i * step_x, j * step_y);
-        }
-    }
 }
 
 // Calls `free` method on the utilized resources.
@@ -305,13 +320,15 @@ int main(int argc, char *argv[]) {
 
     pthread_t threads[num_threads];
     thread_args_t *args[num_threads];
+
     ppm_image *rescaled_img = NULL;
+    ppm_image **contour_map = NULL;
 
     unsigned char **grid = NULL;
 
     for (long id = 0; id < num_threads; id++) {
         args[id] = init_thread_args(num_threads, id, &barrier,
-            &rescaled_img, image, &grid, step_x, step_y, SIGMA);
+            &rescaled_img, image, &grid, step_x, step_y, SIGMA, &contour_map);
 
         int r = pthread_create(&threads[id], NULL, thread_func, args[id]);
 
@@ -331,7 +348,7 @@ int main(int argc, char *argv[]) {
 #endif
 
     // 0. Initialize contour map
-    ppm_image **contour_map = init_contour_map();
+    contour_map = init_contour_map();
 
 #ifdef TIMER
     clock_gettime(CLOCK_MONOTONIC, &finish);
@@ -372,8 +389,8 @@ int main(int argc, char *argv[]) {
     clock_gettime(CLOCK_MONOTONIC, &start);
 #endif
 
-    // 3. March the squares
-    march(scaled_image, grid, contour_map, step_x, step_y);
+    // 3. Wait for march the squares
+    pthread_barrier_wait(&barrier);
 
 #ifdef TIMER
     clock_gettime(CLOCK_MONOTONIC, &finish);
