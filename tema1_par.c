@@ -15,8 +15,6 @@
 #define RESCALE_X               2048
 #define RESCALE_Y               2048
 
-#define TIMER
-
 #define CLAMP(v, min, max) if(v < min) { v = min; } else if(v > max) { v = max; }
 
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
@@ -250,7 +248,8 @@ unsigned char **sample_grid(ppm_image *image, int step_x, int step_y, unsigned c
 }
 
 // Calls `free` method on the utilized resources.
-void free_resources(ppm_image *image, ppm_image **contour_map, unsigned char **grid, int step_x) {
+void free_resources(ppm_image *image, ppm_image **contour_map, unsigned char **grid, int step_x,
+    thread_args_t **args, int num_threads) {
     for (int i = 0; i < CONTOUR_CONFIG_COUNT; i++) {
         free(contour_map[i]->data);
         free(contour_map[i]);
@@ -261,6 +260,11 @@ void free_resources(ppm_image *image, ppm_image **contour_map, unsigned char **g
         free(grid[i]);
     }
     free(grid);
+
+    for (int i = 0; i < num_threads; i++)
+    {
+        free(args[i]);
+    }
 
     free(image->data);
     free(image);
@@ -326,6 +330,7 @@ int main(int argc, char *argv[]) {
 
     unsigned char **grid = NULL;
 
+    // Create worker threads
     for (long id = 0; id < num_threads; id++) {
         args[id] = init_thread_args(num_threads, id, &barrier,
             &rescaled_img, image, &grid, step_x, step_y, SIGMA, &contour_map);
@@ -338,82 +343,33 @@ int main(int argc, char *argv[]) {
         }
     }
 
-#ifdef TIMER
-    struct timespec start, finish;
-    double elapsed;
-#endif
-
-#ifdef TIMER
-    clock_gettime(CLOCK_MONOTONIC, &start);
-#endif
-
     // 0. Initialize contour map
     contour_map = init_contour_map();
-
-#ifdef TIMER
-    clock_gettime(CLOCK_MONOTONIC, &finish);
-    elapsed = (finish.tv_sec - start.tv_sec);
-    elapsed += (finish.tv_nsec - start.tv_nsec) / 1000000000.0;
-    printf("Initialize contour map time: %lf\n", elapsed);
-#endif
-
-#ifdef TIMER
-    clock_gettime(CLOCK_MONOTONIC, &start);
-#endif
 
     // 1. Rescale the image
     ppm_image *scaled_image = rescale_image(image, &rescaled_img, &barrier);
 
-#ifdef TIMER
-    clock_gettime(CLOCK_MONOTONIC, &finish);
-    elapsed = (finish.tv_sec - start.tv_sec);
-    elapsed += (finish.tv_nsec - start.tv_nsec) / 1000000000.0;
-    printf("Rescale the image time: %lf\n", elapsed);
-#endif
-
-#ifdef TIMER
-    clock_gettime(CLOCK_MONOTONIC, &start);
-#endif
-
     // 2. Sample the grid
     grid = sample_grid(scaled_image, step_x, step_y, &grid, &barrier);
-
-#ifdef TIMER
-    clock_gettime(CLOCK_MONOTONIC, &finish);
-    elapsed = (finish.tv_sec - start.tv_sec);
-    elapsed += (finish.tv_nsec - start.tv_nsec) / 1000000000.0;
-    printf("Sample the grid time: %lf\n", elapsed);
-#endif
-
-#ifdef TIMER
-    clock_gettime(CLOCK_MONOTONIC, &start);
-#endif
 
     // 3. Wait for march the squares
     pthread_barrier_wait(&barrier);
 
-#ifdef TIMER
-    clock_gettime(CLOCK_MONOTONIC, &finish);
-    elapsed = (finish.tv_sec - start.tv_sec);
-    elapsed += (finish.tv_nsec - start.tv_nsec) / 1000000000.0;
-    printf("March the squares time: %lf\n", elapsed);
-#endif
+    // Wait for all worker threads to finish (I know the barrier above is useless)
+    for (long id = 0; id < num_threads; id++) {
+        void *status;
+        int r = pthread_join(threads[id], &status);
 
-#ifdef TIMER
-    clock_gettime(CLOCK_MONOTONIC, &start);
-#endif
+        if (r) {
+            printf("Eroare la asteptarea thread-ului %ld\n", id);
+            exit(-1);
+        }
+    }
 
     // 4. Write output
     write_ppm(scaled_image, argv[2]);
 
-#ifdef TIMER
-    clock_gettime(CLOCK_MONOTONIC, &finish);
-    elapsed = (finish.tv_sec - start.tv_sec);
-    elapsed += (finish.tv_nsec - start.tv_nsec) / 1000000000.0;
-    printf("Write output time: %lf\n", elapsed);
-#endif
-
-    free_resources(scaled_image, contour_map, grid, step_x);
+    free_resources(scaled_image, contour_map, grid, step_x, args, num_threads);
 
     return 0;
 }
