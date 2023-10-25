@@ -23,24 +23,129 @@ typedef struct {
     int id;
     int num_threads;
     pthread_barrier_t *barrier;
-    ppm_image **rescaled_image;
     ppm_image *main_image;
+    ppm_image **rescaled_image_p;
+    struct {
+        unsigned char ***grid_p;
+        int sigma;
+        int step_x;
+        int step_y;
+    } sample_grid;
 } thread_args_t;
 
+thread_args_t *init_thread_args(int num_threads, int id, pthread_barrier_t *barrier,
+    ppm_image **rescaled_image_p, ppm_image *image,
+    unsigned char ***grid_p, int step_x, int step_y, int sigma) {
 
-void *thread_func(thread_args_t *args) {
+    thread_args_t *args = malloc(sizeof(thread_args_t));
+
+    args->num_threads = num_threads;
+    args->id = id;
+    args->barrier = barrier;
+    args->rescaled_image_p = rescaled_image_p;
+    args->main_image = image;
+    args->sample_grid.grid_p = grid_p;
+    args->sample_grid.step_x = step_x;
+    args->sample_grid.step_y = step_y;
+    args->sample_grid.sigma = sigma;
+
+    return args;
+}
+
+void bicubic_interp_work(int start, int end, ppm_image *new_image, ppm_image *image) {
+    uint8_t sample[3];
+
+    // use bicubic interpolation for scaling
+    for (int i = start; i < end; i++) {
+        for (int j = 0; j < new_image->y; j++) {
+            float u = (float)i / (float)(new_image->x - 1);
+            float v = (float)j / (float)(new_image->y - 1);
+            sample_bicubic(image, u, v, sample);
+
+            new_image->data[i * new_image->y + j].red = sample[0];
+            new_image->data[i * new_image->y + j].green = sample[1];
+            new_image->data[i * new_image->y + j].blue = sample[2];
+        }
+    }
+}
+
+void sample_grid_work(ppm_image *image, unsigned char **grid, int sigma,
+    int step_x, int step_y, int id, int num_threads) {
+    int p = image->x / step_x;
+    int q = image->y / step_y;
+
+    int p_start = id * (double)p / num_threads;
+    int p_end = MIN((id + 1) * (double)p / num_threads, p);
+
+    int q_start = id * (double)q / num_threads;
+    int q_end = MIN((id + 1) * (double)q / num_threads, q);
+
+    for (int i = p_start; i < p_end; i++) {
+        for (int j = 0; j < q; j++) {
+            ppm_pixel curr_pixel = image->data[i * step_x * image->y + j * step_y];
+
+            unsigned char curr_color = (curr_pixel.red + curr_pixel.green + curr_pixel.blue) / 3;
+
+            if (curr_color > sigma) {
+                grid[i][j] = 0;
+            } else {
+                grid[i][j] = 1;
+            }
+        }
+    }
+
+    // last sample points have no neighbors below / to the right, so we use pixels on the
+    // last row / column of the input image for them
+    for (int i = p_start; i < p_end; i++) {
+        ppm_pixel curr_pixel = image->data[i * step_x * image->y + image->x - 1];
+
+        unsigned char curr_color = (curr_pixel.red + curr_pixel.green + curr_pixel.blue) / 3;
+
+        if (curr_color > sigma) {
+            grid[i][q] = 0;
+        } else {
+            grid[i][q] = 1;
+        }
+    }
+    for (int j = q_start; j < q_end; j++) {
+        ppm_pixel curr_pixel = image->data[(image->x - 1) * image->y + j * step_y];
+
+        unsigned char curr_color = (curr_pixel.red + curr_pixel.green + curr_pixel.blue) / 3;
+
+        if (curr_color > sigma) {
+            grid[p][j] = 0;
+        } else {
+            grid[p][j] = 1;
+        }
+    }
+}
+
+void *thread_func(void *void_args) {
+    thread_args_t *args = (thread_args_t *)void_args;
+
+    // Wait for all threads to be ready to start rescaling
     pthread_barrier_wait(args->barrier);
 
-    if (args->rescaled_image != NULL) {
-        ppm_image *new_image = *(args->rescaled_image);
+    if (*(args->rescaled_image_p) != NULL) {
+        ppm_image *new_image = *(args->rescaled_image_p);
         int start = args->id * (double)new_image->x / args->num_threads;
         int end = MIN((args->id + 1) * (double)new_image->x / args->num_threads, new_image->x);
 
-        bicubic_interp(start, end, new_image, args->main_image);
+        bicubic_interp_work(start, end, new_image, args->main_image);
 
         args->main_image = new_image;
+
+        // Wait for all threads to finish rescaling
+        pthread_barrier_wait(args->barrier);
     }
 
+    // Wait for all threads to be ready to start grid sampling
+    pthread_barrier_wait(args->barrier);
+
+    sample_grid_work(args->main_image, *(args->sample_grid.grid_p), args->sample_grid.sigma,
+        args->sample_grid.step_x, args->sample_grid.step_y, args->id, args->num_threads);
+
+    // Wait for all threads to finish grid sampling
     pthread_barrier_wait(args->barrier);
 
     return NULL;
@@ -84,7 +189,7 @@ void update_image(ppm_image *image, ppm_image *contour, int x, int y) {
 // Builds a p x q grid of points with values which can be either 0 or 1, depending on how the
 // pixel values compare to the `sigma` reference value. The points are taken at equal distances
 // in the original image, based on the `step_x` and `step_y` arguments.
-unsigned char **sample_grid(ppm_image *image, int step_x, int step_y, unsigned char sigma) {
+unsigned char **sample_grid(ppm_image *image, int step_x, int step_y, unsigned char ***grid_p, pthread_barrier_t *barrier) {
     int p = image->x / step_x;
     int q = image->y / step_y;
 
@@ -102,44 +207,13 @@ unsigned char **sample_grid(ppm_image *image, int step_x, int step_y, unsigned c
         }
     }
 
-    for (int i = 0; i < p; i++) {
-        for (int j = 0; j < q; j++) {
-            ppm_pixel curr_pixel = image->data[i * step_x * image->y + j * step_y];
+    *grid_p = grid;
 
-            unsigned char curr_color = (curr_pixel.red + curr_pixel.green + curr_pixel.blue) / 3;
+    // Wait for all threads to be ready to start work
+    pthread_barrier_wait(barrier);
 
-            if (curr_color > sigma) {
-                grid[i][j] = 0;
-            } else {
-                grid[i][j] = 1;
-            }
-        }
-    }
-
-    // last sample points have no neighbors below / to the right, so we use pixels on the
-    // last row / column of the input image for them
-    for (int i = 0; i < p; i++) {
-        ppm_pixel curr_pixel = image->data[i * step_x * image->y + image->x - 1];
-
-        unsigned char curr_color = (curr_pixel.red + curr_pixel.green + curr_pixel.blue) / 3;
-
-        if (curr_color > sigma) {
-            grid[i][q] = 0;
-        } else {
-            grid[i][q] = 1;
-        }
-    }
-    for (int j = 0; j < q; j++) {
-        ppm_pixel curr_pixel = image->data[(image->x - 1) * image->y + j * step_y];
-
-        unsigned char curr_color = (curr_pixel.red + curr_pixel.green + curr_pixel.blue) / 3;
-
-        if (curr_color > sigma) {
-            grid[p][j] = 0;
-        } else {
-            grid[p][j] = 1;
-        }
-    }
+    // Wait for all threads to finish work
+    pthread_barrier_wait(barrier);
 
     return grid;
 }
@@ -177,27 +251,11 @@ void free_resources(ppm_image *image, ppm_image **contour_map, unsigned char **g
     free(image);
 }
 
-void bicubic_interp(int start, int end, ppm_image *new_image, ppm_image *image) {
-    uint8_t sample[3];
-
-    // use bicubic interpolation for scaling
-    for (int i = start; i < end; i++) {
-        for (int j = 0; j < new_image->y; j++) {
-            float u = (float)i / (float)(new_image->x - 1);
-            float v = (float)j / (float)(new_image->y - 1);
-            sample_bicubic(image, u, v, sample);
-
-            new_image->data[i * new_image->y + j].red = sample[0];
-            new_image->data[i * new_image->y + j].green = sample[1];
-            new_image->data[i * new_image->y + j].blue = sample[2];
-        }
-    }
-}
-
 ppm_image *rescale_image(ppm_image *image, ppm_image **rescaled_img,
     pthread_barrier_t *barrier) {
     // we only rescale downwards
     if (image->x <= RESCALE_X && image->y <= RESCALE_Y) {
+        pthread_barrier_wait(barrier);
         return image;
     }
 
@@ -218,7 +276,10 @@ ppm_image *rescale_image(ppm_image *image, ppm_image **rescaled_img,
 
     *rescaled_img = new_image;
 
+    // Wait for all threads to be ready to start
     pthread_barrier_wait(barrier);
+
+    // Wait for all threads to finish work
     pthread_barrier_wait(barrier);
 
     free(image->data);
@@ -237,7 +298,7 @@ int main(int argc, char *argv[]) {
     int step_x = STEP;
     int step_y = STEP;
 
-    int num_threads = argv[3];
+    int num_threads = atoi(argv[3]);
 
     pthread_barrier_t barrier;
     pthread_barrier_init(&barrier, NULL, num_threads + 1);
@@ -246,18 +307,13 @@ int main(int argc, char *argv[]) {
     thread_args_t *args[num_threads];
     ppm_image *rescaled_img = NULL;
 
-    int r;
+    unsigned char **grid = NULL;
 
     for (long id = 0; id < num_threads; id++) {
-        args[id] = malloc(sizeof(thread_args_t));
+        args[id] = init_thread_args(num_threads, id, &barrier,
+            &rescaled_img, image, &grid, step_x, step_y, SIGMA);
 
-        args[id]->num_threads;
-        args[id]->id = id;
-        args[id]->barrier = &barrier;
-        args[id]->rescaled_image = &rescaled_img;
-        args[id]->main_image = image;
-
-        r = pthread_create(&threads[id], NULL, thread_func, args[id]);
+        int r = pthread_create(&threads[id], NULL, thread_func, args[id]);
 
         if (r) {
             printf("Eroare la crearea thread-ului %ld\n", id);
@@ -303,7 +359,7 @@ int main(int argc, char *argv[]) {
 #endif
 
     // 2. Sample the grid
-    unsigned char **grid = sample_grid(scaled_image, step_x, step_y, SIGMA);
+    grid = sample_grid(scaled_image, step_x, step_y, &grid, &barrier);
 
 #ifdef TIMER
     clock_gettime(CLOCK_MONOTONIC, &finish);
